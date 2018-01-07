@@ -1,0 +1,111 @@
+config global
+
+    # Depend startup on particular network(s). This applies to both the
+    # standard config file (uci_enabled=0) and the UCI-controlled config file
+    # (uci_enabled=1)
+    list network 'wan'
+
+    # Whether the config file is auto-generated
+    option uci_enabled '0'
+
+config daemon
+    # Run-as daemon as a user, root is needed for transparent proxy
+    # configuration
+    #option user 'root'
+
+    # Run-as group
+    #option group 'root'
+
+# Global error logging section, not overridable in listeners. Specify either
+# filename, or syslog target, not both
+config error_log
+    # Log file name, cannot be combined with syslog target
+    #option filename '/tmp/sniproxy-error.log'
+
+    # Syslog target, cannot be combined with filename target
+    option syslog 'daemon'
+
+# Global access logging section, overridable in listeners. Specify either
+# filename, or syslog target, not both
+config access_log
+    # Log file name, cannot be combined with syslog target
+    #option filename '/tmp/sniproxy-access.log'
+
+    # Syslog target, cannot be combined with filename target
+    option syslog 'daemon'
+
+    # Minimum priority to log
+    option priority 'notice'
+
+# Listener (proxy) section
+config listen
+    # Listening addresses. The address can be any valid IPv4 or IPv6 address
+    # (surrounded by brackets), or '0.0.0.0' for IPv4 ANY address, or '[::]'
+    # for IPv6/IPv4 any (accepts also IPv4 ANY!), or '[::]' with
+    # ipv6_v6only=yes option (see below) to accept ANY IPv6 addresses only
+    #list address '192.0.2.10'
+
+    # Listening port
+    option port '80'
+
+    # Protocol is either 'http' or 'tls'
+    option protocol 'http'
+
+    # SO_REUSEPORT socket option, i.e. whether the socket can be reused by
+    # other process for simple load balancing
+    option reuseport 'no'
+
+    # Option to listen only on IPv6 when specifying '[::]' ANY address
+    #option ipv6_v6only 'yes'
+
+    # Fallback destination address for unmatched/unknown requests
+    #option fallback '127.0.0.1:8080'
+
+    # Source address to use for requests, or 'client' to reuse source address
+    # and act as a transparent proxy. In case of transparent proxy, running
+    # sniproxy as root is required (see global config section)
+    option source '190.0.2.10'
+
+    # Whether to log content of unparsable requests, useful for debugging
+    #option bad_requests 'log'
+
+    # Access log options - same as global access_log section with access_log
+    # prefix. Specify either filename or syslog target, not both
+    #option access_log_filename '/tmp/sniproxy-access-80.log'
+    option access_log_syslog 'daemon'
+
+    # Forwarding table name. If not specified, default (unnamed) table will be
+    # used
+    option table 'http_hosts'
+
+# Example of ANY TLS listener, use default forwarding table
+config listen
+    list address '[::]'
+    option port '443'
+    option protocol 'tls'
+    option fallback '127.0.0.1:443'
+    option source '190.0.2.10'
+    option access_log_syslog 'daemon'
+
+# Default forwarding table used by listeners without explicit table
+# specification
+config table 'default'
+    # Option forward_pattern accepts a Perl-compatible regular expression to
+    # match requested hostname. The forwarding target is separated by a space
+    # and shall be an IP address. Port can be appended after a colon and if no
+    # port is specified, original requested port is used.
+
+    # Forward any subdomain of example.com to 192.0.2.100 and port 8443
+    list forward_pattern '^.*\.example\.com$ 192.168.0.100:8443'
+
+# Forwarding table referenced by name 'http_hosts'
+config table 'http_hosts'
+    # Forward example.com to 192.0.2.101, reusing the original destination port
+    list forward_pattern '^example\.com$ 192.0.2.101'
+
+    # Forward example.net to 192.0.2.101 and port 8001 with HAProxy protocol
+    # header
+    list forward_pattern '^example\.net$ 192.168.0.101:8001 proxy_protocol'
+
+    # Forward any hostname to 192.0.2.102 and port 8080
+    list forward_pattern '.* 192.0.2.102:8080'

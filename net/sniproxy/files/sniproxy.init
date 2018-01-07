@@ -1,0 +1,226 @@
+#!/bin/sh /etc/rc.common
+
+START=90
+
+USE_PROCD=1
+PROG=/usr/sbin/sniproxy
+USER_CONFFILE=/etc/sniproxy.conf
+GEN_CONFFILE=/tmp/etc/sniproxy.conf
+
+start_service() {
+	generate_configuration
+
+	if [ -n "$DEPEND_IFNAMES" ] ; then
+		# We know the interface, so we can start
+		procd_open_instance
+		procd_set_param respawn
+		procd_set_param command "$PROG" -f
+		if [ $UCI_ENABLED -eq 1 ]; then
+			procd_append_param command -c "$GEN_CONFFILE"
+			procd_set_param file "$GEN_CONFFILE"
+		else
+			procd_append_param command -c "$USER_CONFFILE"
+			procd_set_param file "$USER_CONFFILE"
+		fi
+
+		# Apply as array of interfaces - no quotation marks!
+		procd_set_param netdev $DEPEND_IFNAMES
+
+		procd_close_instance
+	else
+		logger -p daemon.info -t "sniproxy[----]" "Postponing start-up of sniproxy, network is not up"
+	fi
+}
+
+service_triggers()
+{
+	local NETWORK
+	procd_add_reload_trigger sniproxy
+
+	if [ -n "$DEPEND_NETWORKS" ]; then
+		logger -p daemon.info -t "sniproxy[----]" "Listening for changes on network ${DEPEND_NETWORKS// /, }"
+		for NETWORK in $DEPEND_NETWORKS; do
+			# Watch also configuration changes on network
+			procd_add_reload_interface_trigger $NETWORK
+		done
+	fi
+}
+
+service_running()
+{
+	pgrep -x "$PROG" &> /dev/null
+}
+
+reload_service()
+{
+	rc_procd start_service "$@"
+	procd_send_signal sniproxy
+}
+
+generate_configuration()
+{
+	. /lib/functions/network.sh
+
+	local LISTEN_TMP=/tmp/sniproxy.conf.listen.tmp
+	local LISTEN_ACCESS_LOG_TMP=/tmp/sniproxy.conf.listen-access_log.tmp
+	[ -f $LISTEN_TMP ] && rm $LISTEN_TMP
+	[ -f $LISTEN_ACCESS_LOG_TMP ] && rm $LISTEN_ACCESS_LOG_TMP
+
+	UCI_ENABLED=0
+	DEPEND_IFNAMES=
+	DEPEND_NETWORK=
+
+	local SECTION_OPENED=0
+	local LISTEN_ADDRESSES=
+	local LISTEN_PORT=
+
+	config_cb() {
+		local type="$1"
+		local name="$2"
+
+		if [ $UCI_ENABLED -eq 1 ]; then
+			# Close previous section if needed
+			if [ $SECTION_OPENED -eq 1 ]; then
+				echo "}" >> $GEN_CONFFILE
+				SECTION_OPENED=0
+			fi
+
+			# Complete the 'listen' section
+			if [ -n "$LISTEN_ADDRESSES" ] || [ -n "$LISTEN_PORT" ]; then
+				# Finish the listening address specification
+				local ADDRESSES
+				if [ -z "$LISTEN_PORT" ]; then
+					ADDRESSES="$LISTEN_ADDRESSES"
+				elif [ -z "$LISTEN_ADDRESSES" ] && [ -n "$LISTEN_PORT" ]; then
+					ADDRESSES="$LISTEN_PORT"
+				else
+					local ADDRESS
+					for ADDRESS in $LISTEN_ADDRESSES; do
+						append ADDRESSES "$ADDRESS:$LISTEN_PORT"
+					done
+				fi
+
+				# Render corresponding 'listen' sections
+				local ADDRESS
+				for ADDRESS in $ADDRESSES; do
+					echo "listen $ADDRESS {" >> $GEN_CONFFILE
+					[ -f $LISTEN_TMP ] && cat $LISTEN_TMP >> $GEN_CONFFILE
+					if [ -f $LISTEN_ACCESS_LOG_TMP ]; then
+						echo "	access_log {" >> $GEN_CONFFILE
+						cat $LISTEN_ACCESS_LOG_TMP >> $GEN_CONFFILE
+						echo "	}" >> $GEN_CONFFILE
+					fi
+					echo "}" >> $GEN_CONFFILE
+				done
+
+				[ -f $LISTEN_TMP ] && rm $LISTEN_TMP
+				[ -f $LISTEN_ACCESS_LOG_TMP ] && rm $LISTEN_ACCESS_LOG_TMP
+
+				LISTEN_ADDRESSES=
+				LISTEN_PORT=
+			elif [ -f $LISTEN_TMP ]; then
+				logger -p daemon.error -t "sniproxy[----]" "Neither address nor port found in listen configuration"
+				exit 1
+			fi
+		fi
+
+		if [ "$type" = "global" ]; then
+			option_cb() {
+				local option="$1"
+				local value="$2"
+				if [ "$option" = "uci_enabled" ] && [ "$(get_bool "$value" 0)" -eq 1 ] ; then
+					# Create fresh configuration file
+					[ -f $GEN_CONFFILE ] && rm $GEN_CONFFILE
+					> $GEN_CONFFILE
+					chmod 600 $GEN_CONFFILE
+					UCI_ENABLED=1
+				elif [ "$option" = "network" ]; then
+					local IFNAME=
+					network_get_device IFNAME "$value"
+					if [ -n "$IFNAME" ]; then
+						logger -p daemon.debug -t "sniproxy[----]" "Resolved network $value as interface $IFNAME"
+						if ! list_contains DEPEND_IFNAMES $IFNAME; then
+							append DEPEND_IFNAMES $IFNAME
+						fi
+					else
+						logger -p daemon.warn -t "sniproxy[----]" "Cannot find interface for network $value, possibly the network is not up"
+					fi
+
+					append DEPEND_NETWORKS "$value"
+				fi
+			}
+			list_cb() {
+				if [ "$1" = "network" ]; then
+					# Forward for evaluation
+					option_cb "$@"
+				fi
+			}
+		elif [ $UCI_ENABLED -eq 1 ] && [ "$type" = "listen" ]; then
+			> $LISTEN_TMP
+			option_cb() {
+				local option="$1"
+				local value="$2"
+				if [ "$option" = "address" ]; then
+					append LISTEN_ADDRESSES "$value"
+				elif [ "$option" = "port" ]; then
+					LISTEN_PORT="$value"
+				elif [ "$option" = "reuseport" ] || [ "$option" = "ipv6_v6only" ]; then
+					local result="$(get_bool "$value" 0)"
+					if [ $result -eq 1 ]; then
+						echo "	$option yes" >> $LISTEN_TMP
+					else
+						echo "	$option no" >> $LISTEN_TMP
+					fi
+				elif [ ! "${option#access_log_}" = "$option" ]; then
+					# access_log_* entries, render as access_log section
+					echo "		${option#access_log_} $value" >> $LISTEN_ACCESS_LOG_TMP
+				elif [ "$option" = "table" ]; then
+					# Do not output reference to default table
+					local table_name="${value#default}"
+					if [ -n "$table_name" ]; then
+						echo "	$option $value" >> $LISTEN_TMP
+					fi
+				else
+					echo "	$option $value" >> $LISTEN_TMP
+				fi
+			}
+			list_cb() {
+				if [ "$1" = "address" ]; then
+					# Forward for evaluation
+					option_cb "$@"
+				fi
+			}
+		elif [ $UCI_ENABLED -eq 1 ] && [ "$type" = "daemon" ]; then
+			option_cb() { echo "$1 $2" >> $GEN_CONFFILE; }
+			list_cb() { echo "$1 $2" >> $GEN_CONFFILE; }
+		elif [ $UCI_ENABLED -eq 1 ] && ( [ "$type" = "resolver" ] || [ "$type" = "error_log" ] || [ "$type" = "access_log" ] ); then
+			echo "$type {" >> $GEN_CONFFILE
+			SECTION_OPENED=1
+			option_cb() { echo "	$1 $2" >> $GEN_CONFFILE; }
+			list_cb() { echo "	$1 $2" >> $GEN_CONFFILE; }
+		elif [ $UCI_ENABLED -eq 1 ] && [ "$type" = "table" ]; then
+			# Routing table - just write values, they contain regular expressions and forwarding targets
+			if [ "$name" = "default" ]; then
+				echo "table {" >> $GEN_CONFFILE
+			else
+				echo "table ${name} {" >> $GEN_CONFFILE
+			fi
+			SECTION_OPENED=1
+			option_cb() { echo "	$2" >> $GEN_CONFFILE; }
+			list_cb() { echo "	$2" >> $GEN_CONFFILE; }
+		else
+			reset_cb
+		fi
+	}
+
+	if [ -f /etc/config/sniproxy ]; then
+		config_load sniproxy
+	fi
+
+	if [ $UCI_ENABLED -eq 0 ]; then
+		if [ ! -f $USER_CONFFILE ]; then
+			logger -p daemon.error -t "sniproxy[----]" "No $USER_CONFFILE found, not starting"
+			exit 1
+		fi
+	fi
+}

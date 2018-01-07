@@ -1,0 +1,10 @@
+menu "Configuration"
+	depends on PACKAGE_sniproxy
+
+config SNIPROXY_WITH_UDNS
+	bool
+	default y
+	select libudns
+	prompt "Enable hostname or wildcard entries resolution by UDNS"
+
+endmenu
